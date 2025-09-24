@@ -1,36 +1,8 @@
-import React, { useState, useEffect, useRef } from 'react';
+import React, { useState, useEffect, useRef, useCallback, useMemo } from 'react';
 import { LineChart, Line, XAxis, YAxis, CartesianGrid, Tooltip, ResponsiveContainer, AreaChart, Area } from 'recharts';
 import { Download, Wifi, WifiOff, AlertTriangle, Activity } from 'lucide-react';
 
-// Simulate real-time data generation
-const generateSimulatedData = (currentTime, totalMinutes) => {
-  const data = [];
-  const startTime = currentTime - (totalMinutes * 60 * 1000);
-  
-  for (let i = 0; i <= totalMinutes; i += 2) { // Every 2 minutes
-    const timestamp = startTime + (i * 60 * 1000);
-    const time = new Date(timestamp);
-    
-    let bloodLoss = 0;
-    if (i < 20) {
-      bloodLoss = Math.max(0, 10 + (i * 2) + Math.random() * 5);
-    } else if (i < 40) {
-      bloodLoss = 50 + (i - 20) * 8 + Math.random() * 10;
-    } else {
-      bloodLoss = 210 + (i - 40) * 15 + Math.random() * 20;
-    }
-    
-    data.push({
-      time: time.toLocaleTimeString('en-US', { hour12: false }),
-      timestamp: timestamp,
-      bloodLoss: Math.round(bloodLoss),
-      rate: i > 0 ? Math.max(0, Math.round((bloodLoss - (data[data.length - 1]?.bloodLoss || 0)) / 2)) : 0
-    });
-  }
-  return data;
-};
-
-// Classification based on blood loss
+// Memoized classification function
 const getBloodLossClassification = (bloodLoss) => {
   if (bloodLoss >= 500) return { level: 'Major Hemorrhage', color: '#ef4445', alert: 'CRITICAL' };
   if (bloodLoss >= 250) return { level: 'Moderate Hemorrhage', color: '#f97316', alert: 'WARNING' };
@@ -38,20 +10,36 @@ const getBloodLossClassification = (bloodLoss) => {
   return { level: 'Normal bleeding', color: '#22c55e', alert: 'NORMAL' };
 };
 
-function calculateRates(data) {
+// Optimized rate calculation
+const calculateRates = (data) => {
   if (!Array.isArray(data) || data.length < 2) {
-    return (data || []).map(d => ({ ...d, rate: 0 }));
+    return (data || []).map(d => ({ ...d, rate: 0, smoothedRate: 0 }));
   }
 
+  let previousSmoothedRate = 0;
+  const alpha = 0.25;
+
   return data.map((point, i) => {
-    if (i === 0) return { ...point, rate: 0 };
+    if (i === 0) {
+      return { ...point, rate: 0, smoothedRate: 0 };
+    }
+    
     const prev = data[i - 1];
     const bloodDiff = (point.bloodLoss ?? 0) - (prev.bloodLoss ?? 0);
-    const timeDiffMins = (point.timestamp - prev.timestamp) / 60000; // ms -> minutes
-    const rate = timeDiffMins > 0 ? bloodDiff / timeDiffMins : 0;
-    return { ...point, rate };
+    const timeDiffMins = (point.timestamp - prev.timestamp) / 60000;
+    const rate = timeDiffMins > 0 ? Math.max(0, bloodDiff / timeDiffMins) : 0;
+    
+    // Exponential smoothing
+    const smoothedRate = previousSmoothedRate * (1 - alpha) + rate * alpha;
+    previousSmoothedRate = smoothedRate;
+
+    return { 
+      ...point, 
+      rate: Math.round(rate * 10) / 10, 
+      smoothedRate: Math.round(smoothedRate * 10) / 10 
+    };
   });
-}
+};
 
 const HemoDropDashboard = () => {
   const [patients] = useState([
@@ -61,41 +49,83 @@ const HemoDropDashboard = () => {
 
   const [selectedPatient, setSelectedPatient] = useState(patients[0]);
   const [currentView, setCurrentView] = useState('dashboard');
-  const [monitoring, setMonitoring] = useState(false); // Start with monitoring OFF
+  const [monitoring, setMonitoring] = useState(false);
   const [paused, setPaused] = useState(false);
   const [monitoringData, setMonitoringData] = useState([]);
-  const [zoomLevel, setZoomLevel] = useState(60); // minutes
-  const [isBlinking, setIsBlinking] = useState(false);
-  const [activeAlerts, setActiveAlerts] = useState([]);
+  const [zoomLevel, setZoomLevel] = useState(60);
+  
   const startTimeRef = useRef(null);
   const intervalRef = useRef(null);
+  const dataBufferRef = useRef([]);
 
-  // Clear interval helper
-  const clearMonitoringInterval = () => {
+  // Clear interval safely
+  const clearMonitoringInterval = useCallback(() => {
     if (intervalRef.current) {
       clearInterval(intervalRef.current);
       intervalRef.current = null;
     }
-  };
+  }, []);
 
-  // Safe navigation handler
-  const handleNavigation = (view) => {
-    clearMonitoringInterval();
-    setCurrentView(view);
-  };
-
-  // Real-time data simulation
-  useEffect(() => {
-    clearMonitoringInterval(); // Clear any existing interval
+  // Generate simulated data only when needed
+  const generateSimulatedData = useCallback((currentTime, totalMinutes) => {
+    const data = [];
+    const startTime = currentTime - (totalMinutes * 60 * 1000);
     
-    if (!monitoring || paused) return;
+    for (let i = 0; i <= totalMinutes; i += 2) {
+      const timestamp = startTime + (i * 60 * 1000);
+      
+      let bloodLoss = 0;
+      if (i < 20) {
+        bloodLoss = Math.max(0, 10 + (i * 2) + Math.random() * 5);
+      } else if (i < 40) {
+        bloodLoss = 50 + (i - 20) * 8 + Math.random() * 10;
+      } else {
+        bloodLoss = 210 + (i - 40) * 15 + Math.random() * 20;
+      }
+      
+      data.push({
+        time: new Date(timestamp).toLocaleTimeString('en-US', { hour12: false }),
+        timestamp,
+        bloodLoss: Math.round(bloodLoss),
+      });
+    }
+    return calculateRates(data);
+  }, []);
+
+  // Memoized current blood loss
+  const currentBloodLoss = useMemo(() => 
+    monitoringData.length > 0 ? monitoringData[monitoringData.length - 1].bloodLoss : 0, 
+    [monitoringData]
+  );
+
+  // Memoized classification
+  const classification = useMemo(() => 
+    getBloodLossClassification(currentBloodLoss), 
+    [currentBloodLoss]
+  );
+
+  // Optimized data for charts
+  const chartData = useMemo(() => {
+    if (monitoring && monitoringData.length > 0) {
+      const cutoff = Date.now() - zoomLevel * 60 * 1000;
+      return monitoringData.filter(d => d.timestamp >= cutoff);
+    }
+    return generateSimulatedData(Date.now(), zoomLevel);
+  }, [monitoring, monitoringData, zoomLevel, generateSimulatedData]);
+
+  // Real-time data simulation with optimizations
+  useEffect(() => {
+    if (!monitoring || paused) {
+      clearMonitoringInterval();
+      return;
+    }
 
     if (!startTimeRef.current) {
       startTimeRef.current = Date.now();
-      setMonitoringData([]); // Reset data when starting fresh
+      dataBufferRef.current = [];
     }
 
-    let lastLoss = monitoringData.length ? monitoringData[monitoringData.length - 1].bloodLoss : 0;
+    let lastLoss = monitoringData.length > 0 ? monitoringData[monitoringData.length - 1].bloodLoss : 0;
 
     intervalRef.current = setInterval(() => {
       const timestamp = Date.now();
@@ -104,106 +134,146 @@ const HemoDropDashboard = () => {
 
       const newPoint = {
         timestamp,
-        elapsedMinutes: Math.floor((timestamp - startTimeRef.current) / 60000),
         time: new Date(timestamp).toLocaleTimeString('en-US', { hour: '2-digit', minute: '2-digit', hour12: false }),
         bloodLoss: lastLoss,
       };
 
-      setMonitoringData(prev => {
-        const appended = [...prev, newPoint];
-        const withRates = calculateRates(appended);
-        const cutoff = Date.now() - zoomLevel * 60 * 1000;
-        return withRates.filter(d => d.timestamp >= cutoff);
-      });
-    }, 2000);
+      // Use ref for buffer to avoid dependency on monitoringData
+      dataBufferRef.current = [...dataBufferRef.current, newPoint];
+      
+      // Calculate rates in batches for better performance
+      if (dataBufferRef.current.length >= 5) {
+        const processedData = calculateRates(dataBufferRef.current);
+        dataBufferRef.current = []; // Clear buffer after processing
+        
+        setMonitoringData(prev => {
+          const newData = [...prev, ...processedData];
+          const cutoff = Date.now() - zoomLevel * 60 * 1000;
+          return newData.filter(d => d.timestamp >= cutoff);
+        });
+      }
+    }, 3000); // Reduced frequency for better performance
 
     return clearMonitoringInterval;
-  }, [monitoring, paused, zoomLevel]);
+  }, [monitoring, paused, zoomLevel, clearMonitoringInterval]);
 
   // Cleanup on unmount
   useEffect(() => {
-    return clearMonitoringInterval;
-  }, []);
-
-  // Blink effect for critical alerts
-  useEffect(() => {
-    if (!isBlinking) return;
-    
-    const blinkInterval = setInterval(() => {
-      document.body.style.backgroundColor = document.body.style.backgroundColor === 'rgba(239, 68, 68, 0.1)' ? 'white' : 'rgba(239, 68, 68, 0.1)';
-    }, 500);
-
     return () => {
-      clearInterval(blinkInterval);
-      document.body.style.backgroundColor = 'white';
+      clearMonitoringInterval();
     };
-  }, [isBlinking]);
+  }, [clearMonitoringInterval]);
 
-  const currentBloodLoss = monitoringData.length > 0 ? monitoringData[monitoringData.length - 1].bloodLoss : 0;
-  const classification = getBloodLossClassification(currentBloodLoss);
-
-  const liveRateData = monitoring && monitoringData.length
-    ? monitoringData
-    : calculateRates(generateSimulatedData(Date.now(), zoomLevel)).map((d, i) => ({
-        ...d,
-        elapsedMinutes: i * 2
-      }));
-
-  // Process live rate data
-  if (monitoringData.length) {
-    const start = monitoringData[0]?.timestamp ?? Date.now();
-    liveRateData.forEach(d => {
-      d.elapsedMinutes = Math.floor((d.timestamp - start) / 60000);
-    });
-
-    const alpha = 0.25;
-    liveRateData.forEach((d, i) => {
-      if (i === 0) {
-        d.smoothedRate = d.rate ?? 0;
-      } else {
-        const prev = liveRateData[i - 1].smoothedRate ?? 0;
-        d.smoothedRate = prev * (1 - alpha) + (d.rate ?? 0) * alpha;
-      }
-    });
-  }
-
-  const maxElapsed = liveRateData.length ? Math.max(...liveRateData.map(d => d.elapsedMinutes)) : 0;
-  const ticks = [];
-  for (let t = 0; t <= maxElapsed; t += 2) ticks.push(t);
-
-  const downloadPatientHistory = () => {
-    const dataStr = JSON.stringify(monitoringData, null, 2);
-    const dataUri = 'data:application/json;charset=utf-8,'+ encodeURIComponent(dataStr);
-    const exportFileDefaultName = `${selectedPatient.name.replace(' ', '_')}_blood_loss_history.json`;
-    const linkElement = document.createElement('a');
-    linkElement.setAttribute('href', dataUri);
-    linkElement.setAttribute('download', exportFileDefaultName);
-    linkElement.click();
-  };
-
-  const handleStartMonitoring = (patient) => {
+  const handleStartMonitoring = useCallback((patient) => {
     setSelectedPatient(patient);
     setMonitoring(true);
     setPaused(false);
     setMonitoringData([]);
+    dataBufferRef.current = [];
     startTimeRef.current = null;
     setCurrentView('monitoring');
-  };
+  }, []);
 
-  const handlePauseToggle = () => {
+  const handlePauseToggle = useCallback(() => {
     if (paused) {
-      // Resume monitoring
       setPaused(false);
     } else {
-      // Stop/Pause monitoring
       setPaused(true);
       clearMonitoringInterval();
     }
-  };
+  }, [paused, clearMonitoringInterval]);
 
-  // ---------- VIEWS ----------
+  const downloadPatientHistory = useCallback(() => {
+    if (monitoringData.length === 0) return;
+    
+    const dataStr = JSON.stringify(monitoringData, null, 2);
+    const dataUri = 'data:application/json;charset=utf-8,'+ encodeURIComponent(dataStr);
+    const exportFileDefaultName = `${selectedPatient.name.replace(' ', '_')}_blood_loss_history.json`;
+    
+    const linkElement = document.createElement('a');
+    linkElement.setAttribute('href', dataUri);
+    linkElement.setAttribute('download', exportFileDefaultName);
+    linkElement.click();
+  }, [monitoringData, selectedPatient.name]);
 
-  if (currentView === 'dashboard') {
+  // Navigation handler
+  const handleNavigation = useCallback((view) => {
+    clearMonitoringInterval();
+    setCurrentView(view);
+  }, [clearMonitoringInterval]);
+
+  // Memoized chart components to prevent unnecessary re-renders
+  const renderBloodLossChart = useMemo(() => (
+    <ResponsiveContainer width="100%" height={200}>
+      <LineChart data={chartData}>
+        <CartesianGrid strokeDasharray="3 3" />
+        <XAxis 
+          dataKey="timestamp" 
+          type="number" 
+          domain={['dataMin', 'dataMax']} 
+          tick={{ fontSize: 12 }} 
+          tickFormatter={ts => new Date(ts).toLocaleTimeString('en-US', { hour: '2-digit', minute: '2-digit', hour12: false })} 
+        />
+        <YAxis 
+          domain={[0, 'dataMax + 50']} 
+          tick={{ fontSize: 12 }} 
+        />
+        <Tooltip 
+          formatter={(value) => [`${Number(value).toFixed(1)} mL`, 'Blood Loss']} 
+          labelFormatter={ts => new Date(ts).toLocaleTimeString()} 
+        />
+        <Line 
+          type="monotone" 
+          dataKey="bloodLoss" 
+          stroke="#ef4444" 
+          strokeWidth={2} 
+          isAnimationActive={false} 
+          dot={false} 
+        />
+      </LineChart>
+    </ResponsiveContainer>
+  ), [chartData]);
+
+  const renderRateChart = useMemo(() => {
+    const maxElapsed = chartData.length ? Math.max(...chartData.map(d => d.elapsedMinutes || 0)) : 0;
+    const ticks = [];
+    for (let t = 0; t <= maxElapsed; t += 2) ticks.push(t);
+
+    return (
+      <ResponsiveContainer width="100%" height={300}>
+        <AreaChart data={chartData}>
+          <CartesianGrid strokeDasharray="3 3" />
+          <XAxis 
+            dataKey="elapsedMinutes" 
+            type="number" 
+            domain={[0, Math.max(maxElapsed, zoomLevel)]} 
+            ticks={ticks} 
+            tick={{ fontSize: 12 }} 
+            tickFormatter={v => `${v} min`} 
+          />
+          <YAxis 
+            domain={[0, 'dataMax + 5']} 
+            tick={{ fontSize: 12 }} 
+          />
+          <Tooltip 
+            formatter={(value) => [`${Number(value).toFixed(1)} mL/min`, 'Rate']} 
+            labelFormatter={label => `Time: ${label} min`} 
+          />
+          <Area 
+            type="monotone" 
+            dataKey="smoothedRate" 
+            stroke="#3b82f6" 
+            fill="rgba(59, 130, 246, 0.3)" 
+            strokeWidth={2} 
+            isAnimationActive={false} 
+          />
+        </AreaChart>
+      </ResponsiveContainer>
+    );
+  }, [chartData, zoomLevel]);
+
+   // Render different views
+   if (currentView === 'dashboard') {
     return (
       <div className="min-h-screen bg-gray-50">
         <nav className="bg-slate-800 text-white p-4 shadow-lg">
@@ -213,9 +283,9 @@ const HemoDropDashboard = () => {
               Hemodrop Detector
             </h1>
             <div className="flex gap-6">
-              <button onClick={() => setCurrentView('dashboard')} className="text-blue-300 font-medium">Dashboard</button>
-              <button onClick={() => setCurrentView('patients')} className="hover:text-blue-300 transition-colors font-medium">Patients</button>
-              <button onClick={() => setCurrentView('monitoring')} className="hover:text-blue-300 transition-colors font-medium">Monitoring</button>
+              <button onClick={() => handleNavigation('dashboard')} className="text-blue-300 font-medium">Dashboard</button>
+              <button onClick={() => handleNavigation('patients')} className="hover:text-blue-300 transition-colors font-medium">Patients</button>
+              <button onClick={() => handleNavigation('monitoring')} className="hover:text-blue-300 transition-colors font-medium">Monitoring</button>
             </div>
           </div>
         </nav>
@@ -227,7 +297,10 @@ const HemoDropDashboard = () => {
                 <div className="flex justify-between items-start mb-4">
                   <h3 className="text-lg font-semibold text-slate-800">{patient.name}</h3>
                   <div className="flex items-center gap-2">
-                    {monitoring && selectedPatient.id === patient.id ? <Wifi className="w-5 h-5 text-green-500" /> : <WifiOff className="w-5 h-5 text-red-500" />}
+                    {monitoring && selectedPatient.id === patient.id ? 
+                      <Wifi className="w-5 h-5 text-green-500" /> : 
+                      <WifiOff className="w-5 h-5 text-red-500" />
+                    }
                   </div>
                 </div>
 
@@ -267,7 +340,6 @@ const HemoDropDashboard = () => {
     );
   }
 
-  // ---------- PATIENTS VIEW ----------
   if (currentView === 'patients') {
     return (
       <div className="min-h-screen bg-gray-50">
@@ -278,9 +350,9 @@ const HemoDropDashboard = () => {
               Hemodrop Detector
             </h1>
             <div className="flex gap-6">
-              <button onClick={() => setCurrentView('dashboard')} className="hover:text-blue-300 transition-colors font-medium">Dashboard</button>
-              <button onClick={() => setCurrentView('patients')} className="text-blue-300 font-medium">Patients</button>
-              <button onClick={() => setCurrentView('monitoring')} className="hover:text-blue-300 transition-colors font-medium">Monitoring</button>
+              <button onClick={() => handleNavigation('dashboard')} className="hover:text-blue-300 transition-colors font-medium">Dashboard</button>
+              <button onClick={() => handleNavigation('patients')} className="text-blue-300 font-medium">Patients</button>
+              <button onClick={() => handleNavigation('monitoring')} className="hover:text-blue-300 transition-colors font-medium">Monitoring</button>
             </div>
           </div>
         </nav>
@@ -295,7 +367,6 @@ const HemoDropDashboard = () => {
     );
   }
 
-  // ---------- MONITORING VIEW ----------
   if (currentView === 'monitoring') {
     return (
       <div className="min-h-screen bg-gray-50">
@@ -306,19 +377,12 @@ const HemoDropDashboard = () => {
               Hemodrop Detector
             </h1>
             <div className="flex gap-6">
-              <button onClick={() => setCurrentView('dashboard')} className="hover:text-blue-300 transition-colors font-medium">Dashboard</button>
-              <button onClick={() => setCurrentView('patients')} className="hover:text-blue-300 transition-colors font-medium">Patients</button>
-              <button onClick={() => setCurrentView('monitoring')} className="text-blue-300 font-medium">Monitoring</button>
+              <button onClick={() => handleNavigation('dashboard')} className="hover:text-blue-300 transition-colors font-medium">Dashboard</button>
+              <button onClick={() => handleNavigation('patients')} className="hover:text-blue-300 transition-colors font-medium">Patients</button>
+              <button onClick={() => handleNavigation('monitoring')} className="text-blue-300 font-medium">Monitoring</button>
             </div>
           </div>
         </nav>
-
-        {activeAlerts.length > 0 && (
-          <div className="bg-red-600 text-white p-4 text-center font-bold text-lg animate-pulse">
-            <AlertTriangle className="w-6 h-6 inline mr-2" />
-            {activeAlerts[0]}
-          </div>
-        )}
 
         <div className="max-w-7xl mx-auto p-6">
           <div className="bg-slate-800 text-white p-4 rounded-t-lg">
@@ -370,30 +434,13 @@ const HemoDropDashboard = () => {
                     ))}
                   </div>
                 </div>
-
-                <ResponsiveContainer width="100%" height={300}>
-                  <AreaChart data={liveRateData}>
-                    <CartesianGrid strokeDasharray="3 3" />
-                    <XAxis dataKey="elapsedMinutes" type="number" domain={[0, Math.max(maxElapsed, zoomLevel)]} ticks={ticks} tick={{ fontSize: 12 }} tickFormatter={v => `${v} min`} />
-                    <YAxis domain={[0, 'dataMax + 5']} tick={{ fontSize: 12 }} label={{ value: 'Rate (mL/min)', angle: -90, position: 'insideLeft', style: { textAnchor: 'middle' } }} />
-                    <Tooltip formatter={(value, name) => [`${Number(value).toFixed(1)} mL/min`, 'Rate']} labelFormatter={label => `Time: ${label} min`} />
-                    <Area type="monotone" dataKey="smoothedRate" stroke="#3b82f6" fill="rgba(59, 130, 246, 0.3)" strokeWidth={2} isAnimationActive={false} />
-                  </AreaChart>
-                </ResponsiveContainer>
+                {renderRateChart}
               </div>
             </div>
 
             <div className="mt-8">
               <h3 className="text-lg font-semibold mb-4">Live Monitoring Trend</h3>
-              <ResponsiveContainer width="100%" height={200}>
-                <LineChart data={monitoringData}>
-                  <CartesianGrid strokeDasharray="3 3" />
-                  <XAxis dataKey="timestamp" type="number" domain={['dataMin', 'dataMax']} tick={{ fontSize: 12 }} tickFormatter={ts => new Date(ts).toLocaleTimeString('en-US', { hour: '2-digit', minute: '2-digit', hour12: false })} />
-                  <YAxis domain={[0, 'dataMax + 50']} tick={{ fontSize: 12 }} label={{ value: 'Blood Loss (mL)', angle: -90, position: 'insideLeft', style: { textAnchor: 'middle' } }} />
-                  <Tooltip formatter={(value, name) => [`${value.toFixed ? value.toFixed(1) : value} mL`, 'Blood Loss']} labelFormatter={ts => new Date(ts).toLocaleTimeString()} />
-                  <Line type="monotone" dataKey="bloodLoss" stroke="#ef4444" strokeWidth={2} isAnimationActive={false} dot={false} />
-                </LineChart>
-              </ResponsiveContainer>
+              {renderBloodLossChart}
             </div>
 
             {/* Classification History Table */}
@@ -430,7 +477,6 @@ const HemoDropDashboard = () => {
                 </table>
               </div>
               
-              {/* Download Button at bottom of classification table */}
               <div className="mt-4 flex justify-end">
                 <button 
                   onClick={downloadPatientHistory} 

@@ -1,8 +1,13 @@
-import React from 'react'
-import HemoDropDashboard from './components/HemoDropDashboard'
+import React from "react";
+import { MonitoringProvider } from "./store/MonitoringContext";
+import HemoDropDashboard from "./components/HemoDropDashboard";
 
 const App = () => {
-  return <HemoDropDashboard />
-}
+  return (
+    <MonitoringProvider>
+      <HemoDropDashboard />
+    </MonitoringProvider>
+  );
+};
 
-export default App
+export default App;
