@@ -1,6 +1,16 @@
 import React, { useState, useEffect, useRef, useCallback, useMemo } from 'react';
 import { LineChart, Line, XAxis, YAxis, CartesianGrid, Tooltip, ResponsiveContainer, AreaChart, Area } from 'recharts';
-import { Download, Wifi, WifiOff, AlertTriangle, Activity } from 'lucide-react';
+import { Download, Wifi, WifiOff, AlertTriangle, Activity, Server, ServerOff } from 'lucide-react';
+
+// Configuration - using fallback values since process.env is not available in Claude artifacts
+const BACKEND_CONFIG = {
+  HOST: 'localhost', // In real app: process.env.REACT_APP_BACKEND_HOST || 'localhost'
+  PORT: '8000',      // In real app: process.env.REACT_APP_BACKEND_PORT || '8000'
+  USE_SIMULATION: true, // In real app: process.env.REACT_APP_USE_SIMULATION !== 'false'
+};
+
+const API_BASE_URL = `http://${BACKEND_CONFIG.HOST}:${BACKEND_CONFIG.PORT}`;
+const WS_URL = `ws://${BACKEND_CONFIG.HOST}:${BACKEND_CONFIG.PORT}/ws`;
 
 // Memoized classification function
 const getBloodLossClassification = (bloodLoss) => {
@@ -10,18 +20,27 @@ const getBloodLossClassification = (bloodLoss) => {
   return { level: 'Normal bleeding', color: '#22c55e', alert: 'NORMAL' };
 };
 
-// Optimized rate calculation
+// Optimized rate calculation with elapsed minutes
 const calculateRates = (data) => {
   if (!Array.isArray(data) || data.length < 2) {
-    return (data || []).map(d => ({ ...d, rate: 0, smoothedRate: 0 }));
+    return (data || []).map((d, i) => ({ 
+      ...d, 
+      rate: 0, 
+      smoothedRate: 0, 
+      elapsedMinutes: i * 2 // Default 2-minute intervals
+    }));
   }
 
   let previousSmoothedRate = 0;
   const alpha = 0.25;
+  const startTime = data[0]?.timestamp || Date.now();
 
   return data.map((point, i) => {
+    // Calculate elapsed minutes from start
+    const elapsedMinutes = Math.round((point.timestamp - startTime) / 60000);
+    
     if (i === 0) {
-      return { ...point, rate: 0, smoothedRate: 0 };
+      return { ...point, rate: 0, smoothedRate: 0, elapsedMinutes: 0 };
     }
     
     const prev = data[i - 1];
@@ -36,7 +55,8 @@ const calculateRates = (data) => {
     return { 
       ...point, 
       rate: Math.round(rate * 10) / 10, 
-      smoothedRate: Math.round(smoothedRate * 10) / 10 
+      smoothedRate: Math.round(smoothedRate * 10) / 10,
+      elapsedMinutes: Math.max(0, elapsedMinutes)
     };
   });
 };
@@ -54,20 +74,162 @@ const HemoDropDashboard = () => {
   const [monitoringData, setMonitoringData] = useState([]);
   const [zoomLevel, setZoomLevel] = useState(60);
   
+  // Backend integration states
+  const [backendConnected, setBackendConnected] = useState(false);
+  const [backendMode, setBackendMode] = useState('unknown');
+  const [connectionError, setConnectionError] = useState(null);
+  const [isUsingBackend, setIsUsingBackend] = useState(BACKEND_CONFIG.USE_SIMULATION);
+  
   const startTimeRef = useRef(null);
   const intervalRef = useRef(null);
   const dataBufferRef = useRef([]);
+  const wsRef = useRef(null);
+  const reconnectTimeoutRef = useRef(null);
 
-  // Clear interval safely
-  const clearMonitoringInterval = useCallback(() => {
-    if (intervalRef.current) {
-      clearInterval(intervalRef.current);
-      intervalRef.current = null;
+  // WebSocket connection management
+  const connectWebSocket = useCallback(() => {
+    if (wsRef.current?.readyState === WebSocket.OPEN) {
+      return;
     }
-  }, []);
 
-  // Generate simulated data only when needed
-  const generateSimulatedData = useCallback((currentTime, totalMinutes) => {
+    try {
+      wsRef.current = new WebSocket(WS_URL);
+
+      wsRef.current.onopen = () => {
+        console.log('WebSocket connected');
+        setBackendConnected(true);
+        setConnectionError(null);
+      };
+
+      wsRef.current.onmessage = (event) => {
+        try {
+          const message = JSON.parse(event.data);
+          
+          if (message.type === 'connection_established') {
+            setBackendMode(message.mode || 'unknown');
+            console.log(`Connected to backend in ${message.mode} mode`);
+          } else if (message.type === 'real_time_data') {
+            handleBackendData(message.data);
+          }
+        } catch (error) {
+          console.error('Error parsing WebSocket message:', error);
+        }
+      };
+
+      wsRef.current.onclose = () => {
+        console.log('WebSocket disconnected');
+        setBackendConnected(false);
+        
+        // Attempt to reconnect after delay
+        if (isUsingBackend) {
+          reconnectTimeoutRef.current = setTimeout(() => {
+            connectWebSocket();
+          }, 5000);
+        }
+      };
+
+      wsRef.current.onerror = (error) => {
+        console.error('WebSocket error:', error);
+        setConnectionError('Failed to connect to backend');
+        setBackendConnected(false);
+      };
+
+    } catch (error) {
+      console.error('Failed to create WebSocket:', error);
+      setConnectionError('WebSocket creation failed');
+    }
+  }, [isUsingBackend]);
+
+  // Handle data from backend
+  const handleBackendData = useCallback((data) => {
+    if (data.patient_id !== selectedPatient.id.toString()) {
+      return; // Ignore data for other patients
+    }
+
+    const newPoint = {
+      timestamp: new Date(data.timestamp).getTime(),
+      time: new Date(data.timestamp).toLocaleTimeString('en-US', { hour: '2-digit', minute: '2-digit', hour12: false }),
+      bloodLoss: data.volume_ml,
+      rate: data.rate_ml_min,
+    };
+
+    setMonitoringData(prev => {
+      const newData = [...prev, newPoint];
+      const cutoff = Date.now() - zoomLevel * 60 * 1000;
+      const filteredData = newData.filter(d => d.timestamp >= cutoff);
+      
+      // Calculate rates with elapsed minutes
+      return calculateRates(filteredData);
+    });
+  }, [selectedPatient.id, zoomLevel]);
+
+  // Backend API calls
+  const sendDataToBackend = useCallback(async (data) => {
+    if (!isUsingBackend || !backendConnected) return;
+
+    try {
+      await fetch(`${API_BASE_URL}/api/data`, {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+        },
+        body: JSON.stringify({
+          volume_ml: data.bloodLoss,
+          rate_ml_min: data.rate || 0,
+          timestamp: data.timestamp / 1000, // Convert to seconds
+          patient_id: selectedPatient.id.toString(),
+        }),
+      });
+    } catch (error) {
+      console.error('Error sending data to backend:', error);
+    }
+  }, [isUsingBackend, backendConnected, selectedPatient.id]);
+
+  const fetchPatientHistory = useCallback(async (patientId, hours = 24) => {
+    if (!isUsingBackend || !backendConnected) return [];
+
+    try {
+      const response = await fetch(`${API_BASE_URL}/api/history/${patientId}?hours=${hours}`);
+      if (response.ok) {
+        const data = await response.json();
+        return data.history.map(item => ({
+          timestamp: new Date(item.timestamp).getTime(),
+          time: item.time,
+          bloodLoss: item.volume_ml,
+          rate: item.rate_ml_min,
+        }));
+      }
+    } catch (error) {
+      console.error('Error fetching patient history:', error);
+    }
+    return [];
+  }, [isUsingBackend, backendConnected]);
+
+  const generateSimulatedData = useCallback(async () => {
+    if (!isUsingBackend || !backendConnected || backendMode !== 'simulation') {
+      // Fallback to frontend simulation
+      return generateFallbackData();
+    }
+
+    try {
+      await fetch(`${API_BASE_URL}/api/simulate`, {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+        },
+        body: JSON.stringify({
+          duration_minutes: 10,
+          max_volume: 500,
+          patient_id: selectedPatient.id.toString(),
+        }),
+      });
+    } catch (error) {
+      console.error('Error generating simulated data:', error);
+    }
+  }, [isUsingBackend, backendConnected, backendMode, selectedPatient.id]);
+
+  // Fallback data generation for when backend is unavailable
+  const generateFallbackData = useCallback((currentTime = Date.now(), totalMinutes = 60) => {
     const data = [];
     const startTime = currentTime - (totalMinutes * 60 * 1000);
     
@@ -87,10 +249,40 @@ const HemoDropDashboard = () => {
         time: new Date(timestamp).toLocaleTimeString('en-US', { hour12: false }),
         timestamp,
         bloodLoss: Math.round(bloodLoss),
+        elapsedMinutes: i, // Add elapsed minutes for rate chart
       });
     }
     return calculateRates(data);
   }, []);
+
+  // Clear interval safely
+  const clearMonitoringInterval = useCallback(() => {
+    if (intervalRef.current) {
+      clearInterval(intervalRef.current);
+      intervalRef.current = null;
+    }
+  }, []);
+
+  // Check backend health on component mount
+  useEffect(() => {
+    if (!isUsingBackend) return;
+
+    const checkBackendHealth = async () => {
+      try {
+        const response = await fetch(`${API_BASE_URL}/health`);
+        if (response.ok) {
+          const health = await response.json();
+          setBackendMode(health.mode);
+          connectWebSocket();
+        }
+      } catch (error) {
+        console.error('Backend health check failed:', error);
+        setConnectionError('Backend unavailable');
+      }
+    };
+
+    checkBackendHealth();
+  }, [isUsingBackend, connectWebSocket]);
 
   // Memoized current blood loss
   const currentBloodLoss = useMemo(() => 
@@ -110,10 +302,10 @@ const HemoDropDashboard = () => {
       const cutoff = Date.now() - zoomLevel * 60 * 1000;
       return monitoringData.filter(d => d.timestamp >= cutoff);
     }
-    return generateSimulatedData(Date.now(), zoomLevel);
-  }, [monitoring, monitoringData, zoomLevel, generateSimulatedData]);
+    return generateFallbackData(Date.now(), zoomLevel);
+  }, [monitoring, monitoringData, zoomLevel, generateFallbackData]);
 
-  // Real-time data simulation with optimizations
+  // Real-time data simulation with backend integration
   useEffect(() => {
     if (!monitoring || paused) {
       clearMonitoringInterval();
@@ -125,6 +317,13 @@ const HemoDropDashboard = () => {
       dataBufferRef.current = [];
     }
 
+    // If using backend and connected, let backend handle data generation
+    if (isUsingBackend && backendConnected && backendMode === 'simulation') {
+      // Backend will send data via WebSocket
+      return;
+    }
+
+    // Fallback to frontend simulation
     let lastLoss = monitoringData.length > 0 ? monitoringData[monitoringData.length - 1].bloodLoss : 0;
 
     intervalRef.current = setInterval(() => {
@@ -138,33 +337,43 @@ const HemoDropDashboard = () => {
         bloodLoss: lastLoss,
       };
 
-      // Use ref for buffer to avoid dependency on monitoringData
+      // Send to backend if connected
+      sendDataToBackend(newPoint);
+
       dataBufferRef.current = [...dataBufferRef.current, newPoint];
       
-      // Calculate rates in batches for better performance
       if (dataBufferRef.current.length >= 5) {
         const processedData = calculateRates(dataBufferRef.current);
-        dataBufferRef.current = []; // Clear buffer after processing
+        dataBufferRef.current = [];
         
         setMonitoringData(prev => {
           const newData = [...prev, ...processedData];
           const cutoff = Date.now() - zoomLevel * 60 * 1000;
-          return newData.filter(d => d.timestamp >= cutoff);
+          const filteredData = newData.filter(d => d.timestamp >= cutoff);
+          
+          // Recalculate with proper elapsed minutes
+          return calculateRates(filteredData);
         });
       }
-    }, 3000); // Reduced frequency for better performance
+    }, 3000);
 
     return clearMonitoringInterval;
-  }, [monitoring, paused, zoomLevel, clearMonitoringInterval]);
+  }, [monitoring, paused, zoomLevel, clearMonitoringInterval, isUsingBackend, backendConnected, backendMode, sendDataToBackend]);
 
   // Cleanup on unmount
   useEffect(() => {
     return () => {
       clearMonitoringInterval();
+      if (wsRef.current) {
+        wsRef.current.close();
+      }
+      if (reconnectTimeoutRef.current) {
+        clearTimeout(reconnectTimeoutRef.current);
+      }
     };
   }, [clearMonitoringInterval]);
 
-  const handleStartMonitoring = useCallback((patient) => {
+  const handleStartMonitoring = useCallback(async (patient) => {
     setSelectedPatient(patient);
     setMonitoring(true);
     setPaused(false);
@@ -172,7 +381,15 @@ const HemoDropDashboard = () => {
     dataBufferRef.current = [];
     startTimeRef.current = null;
     setCurrentView('monitoring');
-  }, []);
+
+    // Load historical data from backend if available
+    if (isUsingBackend && backendConnected) {
+      const history = await fetchPatientHistory(patient.id.toString(), 1);
+      if (history.length > 0) {
+        setMonitoringData(calculateRates(history));
+      }
+    }
+  }, [isUsingBackend, backendConnected, fetchPatientHistory]);
 
   const handlePauseToggle = useCallback(() => {
     if (paused) {
@@ -201,6 +418,51 @@ const HemoDropDashboard = () => {
     clearMonitoringInterval();
     setCurrentView(view);
   }, [clearMonitoringInterval]);
+
+  // Toggle backend usage
+  const toggleBackendUsage = useCallback(() => {
+    setIsUsingBackend(prev => !prev);
+    if (!isUsingBackend) {
+      connectWebSocket();
+    } else {
+      if (wsRef.current) {
+        wsRef.current.close();
+      }
+      setBackendConnected(false);
+    }
+  }, [isUsingBackend, connectWebSocket]);
+
+  // Backend status indicator component
+  const BackendStatus = () => (
+    <div className="flex items-center gap-2">
+      {isUsingBackend ? (
+        <>
+          {backendConnected ? (
+            <div className="flex items-center gap-2 text-green-400">
+              <Server className="w-4 h-4" />
+              <span className="text-sm font-medium">Backend: {backendMode}</span>
+            </div>
+          ) : (
+            <div className="flex items-center gap-2 text-red-400">
+              <ServerOff className="w-4 h-4" />
+              <span className="text-sm font-medium">Backend: Disconnected</span>
+            </div>
+          )}
+        </>
+      ) : (
+        <div className="flex items-center gap-2 text-yellow-400">
+          <Activity className="w-4 h-4" />
+          <span className="text-sm font-medium">Frontend Only</span>
+        </div>
+      )}
+      <button
+        onClick={toggleBackendUsage}
+        className="text-xs px-2 py-1 bg-slate-600 rounded hover:bg-slate-500 transition-colors"
+      >
+        Toggle
+      </button>
+    </div>
+  );
 
   // Memoized chart components to prevent unnecessary re-renders
   const renderBloodLossChart = useMemo(() => (
@@ -235,9 +497,24 @@ const HemoDropDashboard = () => {
   ), [chartData]);
 
   const renderRateChart = useMemo(() => {
-    const maxElapsed = chartData.length ? Math.max(...chartData.map(d => d.elapsedMinutes || 0)) : 0;
+    if (!chartData || chartData.length === 0) {
+      return (
+        <ResponsiveContainer width="100%" height={300}>
+          <div className="flex items-center justify-center h-full text-gray-500">
+            No rate data available
+          </div>
+        </ResponsiveContainer>
+      );
+    }
+
+    const maxElapsed = Math.max(...chartData.map(d => d.elapsedMinutes || 0));
+    const maxRate = Math.max(...chartData.map(d => d.smoothedRate || 0));
+    
+    // Generate tick marks every 2 minutes
     const ticks = [];
-    for (let t = 0; t <= maxElapsed; t += 2) ticks.push(t);
+    for (let t = 0; t <= Math.max(maxElapsed, zoomLevel); t += Math.max(2, Math.ceil(maxElapsed / 10))) {
+      ticks.push(t);
+    }
 
     return (
       <ResponsiveContainer width="100%" height={300}>
@@ -249,14 +526,16 @@ const HemoDropDashboard = () => {
             domain={[0, Math.max(maxElapsed, zoomLevel)]} 
             ticks={ticks} 
             tick={{ fontSize: 12 }} 
-            tickFormatter={v => `${v} min`} 
+            tickFormatter={v => `${v}min`} 
+            label={{ value: 'Time (minutes)', position: 'insideBottom', offset: -5 }}
           />
           <YAxis 
-            domain={[0, 'dataMax + 5']} 
+            domain={[0, Math.max(maxRate + 5, 10)]} 
             tick={{ fontSize: 12 }} 
+            label={{ value: 'Rate (mL/min)', angle: -90, position: 'insideLeft' }}
           />
           <Tooltip 
-            formatter={(value) => [`${Number(value).toFixed(1)} mL/min`, 'Rate']} 
+            formatter={(value, name) => [`${Number(value).toFixed(1)} mL/min`, 'Blood Loss Rate']} 
             labelFormatter={label => `Time: ${label} min`} 
           />
           <Area 
@@ -266,6 +545,7 @@ const HemoDropDashboard = () => {
             fill="rgba(59, 130, 246, 0.3)" 
             strokeWidth={2} 
             isAnimationActive={false} 
+            connectNulls={false}
           />
         </AreaChart>
       </ResponsiveContainer>
@@ -282,13 +562,23 @@ const HemoDropDashboard = () => {
               <Activity className="w-8 h-8 text-blue-400" />
               Hemodrop Detector
             </h1>
-            <div className="flex gap-6">
+            <div className="flex items-center gap-6">
+              <BackendStatus />
               <button onClick={() => handleNavigation('dashboard')} className="text-blue-300 font-medium">Dashboard</button>
               <button onClick={() => handleNavigation('patients')} className="hover:text-blue-300 transition-colors font-medium">Patients</button>
               <button onClick={() => handleNavigation('monitoring')} className="hover:text-blue-300 transition-colors font-medium">Monitoring</button>
             </div>
           </div>
         </nav>
+
+        {connectionError && (
+          <div className="bg-red-100 border border-red-400 text-red-700 px-4 py-3 mx-6 mt-4 rounded">
+            <div className="flex items-center gap-2">
+              <AlertTriangle className="w-5 h-5" />
+              <span>{connectionError}</span>
+            </div>
+          </div>
+        )}
 
         <div className="max-w-7xl mx-auto p-6">
           <div className="grid grid-cols-1 lg:grid-cols-2 gap-6 bg-white p-6 rounded-b-lg shadow-lg">
@@ -301,6 +591,9 @@ const HemoDropDashboard = () => {
                       <Wifi className="w-5 h-5 text-green-500" /> : 
                       <WifiOff className="w-5 h-5 text-red-500" />
                     }
+                    {isUsingBackend && backendConnected && (
+                      <Server className="w-4 h-4 text-blue-500" />
+                    )}
                   </div>
                 </div>
 
@@ -349,7 +642,8 @@ const HemoDropDashboard = () => {
               <Activity className="w-8 h-8 text-blue-400" />
               Hemodrop Detector
             </h1>
-            <div className="flex gap-6">
+            <div className="flex items-center gap-6">
+              <BackendStatus />
               <button onClick={() => handleNavigation('dashboard')} className="hover:text-blue-300 transition-colors font-medium">Dashboard</button>
               <button onClick={() => handleNavigation('patients')} className="text-blue-300 font-medium">Patients</button>
               <button onClick={() => handleNavigation('monitoring')} className="hover:text-blue-300 transition-colors font-medium">Monitoring</button>
@@ -376,7 +670,8 @@ const HemoDropDashboard = () => {
               <Activity className="w-8 h-8 text-blue-400" />
               Hemodrop Detector
             </h1>
-            <div className="flex gap-6">
+            <div className="flex items-center gap-6">
+              <BackendStatus />
               <button onClick={() => handleNavigation('dashboard')} className="hover:text-blue-300 transition-colors font-medium">Dashboard</button>
               <button onClick={() => handleNavigation('patients')} className="hover:text-blue-300 transition-colors font-medium">Patients</button>
               <button onClick={() => handleNavigation('monitoring')} className="text-blue-300 font-medium">Monitoring</button>
@@ -386,8 +681,18 @@ const HemoDropDashboard = () => {
 
         <div className="max-w-7xl mx-auto p-6">
           <div className="bg-slate-800 text-white p-4 rounded-t-lg">
-            <h2 className="text-xl font-bold">{selectedPatient.name.toUpperCase()}</h2>
-            <p className="text-slate-300">Bed: {selectedPatient.bed} - Delivery Room {selectedPatient.room} - {selectedPatient.deliveryType} Birth</p>
+            <div className="flex justify-between items-center">
+              <div>
+                <h2 className="text-xl font-bold">{selectedPatient.name.toUpperCase()}</h2>
+                <p className="text-slate-300">Bed: {selectedPatient.bed} - Delivery Room {selectedPatient.room} - {selectedPatient.deliveryType} Birth</p>
+              </div>
+              <div className="text-right">
+                <p className="text-sm text-slate-300">Data Source:</p>
+                <p className="font-medium">
+                  {isUsingBackend ? (backendConnected ? `Backend (${backendMode})` : 'Backend (Disconnected)') : 'Frontend Only'}
+                </p>
+              </div>
+            </div>
           </div>
 
           <div className="bg-white rounded-b-lg shadow-lg p-6">
@@ -402,7 +707,7 @@ const HemoDropDashboard = () => {
                     {classification.level.toUpperCase()}
                   </div>
                   
-                  <div className="mt-6">
+                  <div className="mt-6 space-y-2">
                     <button
                       onClick={handlePauseToggle}
                       disabled={!monitoring}
@@ -413,6 +718,15 @@ const HemoDropDashboard = () => {
                     >
                       {paused ? 'Resume Monitoring' : 'Stop Monitoring'}
                     </button>
+                    
+                    {isUsingBackend && backendConnected && backendMode === 'simulation' && (
+                      <button
+                        onClick={generateSimulatedData}
+                        className="w-full px-4 py-2 bg-blue-500 hover:bg-blue-600 text-white rounded font-medium transition-colors"
+                      >
+                        Generate Test Data
+                      </button>
+                    )}
                   </div>
                 </div>
               </div>
@@ -453,6 +767,8 @@ const HemoDropDashboard = () => {
                       <th className="px-4 py-3 text-left text-sm font-medium text-gray-700">Time</th>
                       <th className="px-4 py-3 text-left text-sm font-medium text-gray-700">Classification</th>
                       <th className="px-4 py-3 text-left text-sm font-medium text-gray-700">Blood Loss (mL)</th>
+                      <th className="px-4 py-3 text-left text-sm font-medium text-gray-700">Rate (mL/min)</th>
+                      <th className="px-4 py-3 text-left text-sm font-medium text-gray-700">Source</th>
                     </tr>
                   </thead>
                   <tbody className="divide-y divide-gray-200">
@@ -463,12 +779,16 @@ const HemoDropDashboard = () => {
                           <td className="px-4 py-3 text-sm font-medium">{reading.time}</td>
                           <td className="px-4 py-3 text-sm">{readingClassification.level}</td>
                           <td className="px-4 py-3 text-sm font-medium">{reading.bloodLoss}mL</td>
+                          <td className="px-4 py-3 text-sm">{reading.rate?.toFixed(1) || '0.0'}</td>
+                          <td className="px-4 py-3 text-sm text-gray-500">
+                            {isUsingBackend && backendConnected ? 'Backend' : 'Frontend'}
+                          </td>
                         </tr>
                       );
                     })}
                     {monitoringData.length === 0 && (
                       <tr>
-                        <td className="px-4 py-8 text-sm text-gray-500 text-center" colSpan={3}>
+                        <td className="px-4 py-8 text-sm text-gray-500 text-center" colSpan={5}>
                           No monitoring data available. Start monitoring to see classification history.
                         </td>
                       </tr>
@@ -477,7 +797,30 @@ const HemoDropDashboard = () => {
                 </table>
               </div>
               
-              <div className="mt-4 flex justify-end">
+              <div className="mt-4 flex justify-between items-center">
+                <div className="text-sm text-gray-600">
+                  {isUsingBackend ? (
+                    <div className="flex items-center gap-2">
+                      {backendConnected ? (
+                        <>
+                          <div className="w-2 h-2 bg-green-500 rounded-full"></div>
+                          <span>Connected to backend ({backendMode} mode)</span>
+                        </>
+                      ) : (
+                        <>
+                          <div className="w-2 h-2 bg-red-500 rounded-full"></div>
+                          <span>Backend disconnected - using fallback data</span>
+                        </>
+                      )}
+                    </div>
+                  ) : (
+                    <div className="flex items-center gap-2">
+                      <div className="w-2 h-2 bg-yellow-500 rounded-full"></div>
+                      <span>Frontend simulation mode</span>
+                    </div>
+                  )}
+                </div>
+                
                 <button 
                   onClick={downloadPatientHistory} 
                   disabled={monitoringData.length === 0}
@@ -489,6 +832,56 @@ const HemoDropDashboard = () => {
                 >
                   <Download className="w-4 h-4" /> Download History
                 </button>
+              </div>
+            </div>
+
+            {/* Connection Settings Panel */}
+            <div className="mt-8 p-4 bg-gray-50 rounded-lg">
+              <h3 className="text-lg font-semibold mb-4">Connection Settings</h3>
+              <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
+                <div>
+                  <label className="block text-sm font-medium text-gray-700 mb-2">Backend URL</label>
+                  <input
+                    type="text"
+                    value={API_BASE_URL}
+                    readOnly
+                    className="w-full px-3 py-2 border border-gray-300 rounded-md bg-gray-100 text-sm"
+                  />
+                </div>
+                <div>
+                  <label className="block text-sm font-medium text-gray-700 mb-2">WebSocket URL</label>
+                  <input
+                    type="text"
+                    value={WS_URL}
+                    readOnly
+                    className="w-full px-3 py-2 border border-gray-300 rounded-md bg-gray-100 text-sm"
+                  />
+                </div>
+                <div className="md:col-span-2">
+                  <div className="flex items-center gap-4">
+                    <label className="flex items-center gap-2">
+                      <input
+                        type="checkbox"
+                        checked={isUsingBackend}
+                        onChange={toggleBackendUsage}
+                        className="w-4 h-4 text-blue-600 border-gray-300 rounded focus:ring-blue-500"
+                      />
+                      <span className="text-sm font-medium text-gray-700">Use Backend Integration</span>
+                    </label>
+                    
+                    {isUsingBackend && !backendConnected && (
+                      <button
+                        onClick={connectWebSocket}
+                        className="px-3 py-1 bg-blue-500 hover:bg-blue-600 text-white rounded text-sm transition-colors"
+                      >
+                        Reconnect
+                      </button>
+                    )}
+                  </div>
+                  <p className="text-xs text-gray-500 mt-1">
+                    Toggle between backend integration and frontend-only simulation mode
+                  </p>
+                </div>
               </div>
             </div>
           </div>

@@ -10,4 +10,7 @@ asyncio-mqtt==0.16.1
 pyserial==3.5
 RPi.GPIO==0.7.1    # For Raspberry Pi GPIO
 hx711py==1.2.0     # For load cell interface
-w1thermsensor==2.0.0  # For temperature sensors
+w1thermsensor==2.0.0  # For temperature sensorsfastapi==0.104.1
+uvicorn==0.24.0
+python-dotenv==1.0.0
+pydantic==2.5.0
